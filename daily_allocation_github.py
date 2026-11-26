@@ -1,110 +1,118 @@
+#!/usr/bin/env python3
+"""
+Partial-day (UTC) trade-count summary from Coinbase Exchange -> ntfy.sh
+
+- Walks Coinbase "matches" (public trades) backwards from the latest trade
+  until it crosses 00:00:00 UTC of today. Nothing is saved to disk; trades are
+  counted on the fly into 500-wide price buckets.
+- Prints the summary to the console and posts the same body to ntfy.
+- If the body is larger than ntfy's message limit (4096 bytes), nothing is sent.
+"""
+import math
 import os
 import sys
 import time
-from datetime import datetime, timedelta, timezone
+from collections import Counter
+from datetime import datetime, timezone
 
 import requests
 
-# ---------------- Config (can be overridden by environment variables) ----------------
-PRODUCT_ID = os.getenv("PRODUCT_ID", "BTC-USD")
+PRODUCT_ID = os.environ.get("PRODUCT_ID", "BTC-USD")
+NTFY_URL = os.environ.get("NTFY_URL", "https://ntfy.sh/daily_allocation")
 BUCKET = 500
-NTFY_URL = os.getenv("NTFY_URL", "https://ntfy.sh/daily_allocation")
-NTFY_MAX_BYTES = 4096                                   # ntfy message size limit; if exceeded, nothing is sent
-SUMMARY_DAY = os.getenv("SUMMARY_DAY", "yesterday")     # "yesterday" = previous full UTC day, "today" = current UTC day so far
-MAX_PAGES = int(os.getenv("MAX_PAGES", "0"))            # 0 = no limit; set e.g. 20 for a quick test (partial counts)
-PAGE_LIMIT = 1000
-SLEEP_BETWEEN_CALLS = 0.12                              # Coinbase public limit is ~10 requests/sec
-MAX_RETRIES = 5
-
-TRADES_URL = f"https://api.exchange.coinbase.com/products/{PRODUCT_ID}/trades"
-HEADERS = {"User-Agent": "github-daily-allocation/1.0"}
+NTFY_MAX_BYTES = 4096          # ntfy.sh message size limit
+API_URL = f"https://api.exchange.coinbase.com/products/{PRODUCT_ID}/trades"
+PAGE_LIMIT = 1000              # max allowed by Coinbase
+PAUSE = 0.15                   # seconds between calls (public limit ~10 req/s)
 
 
-def parse_time(s: str) -> datetime:
-    return datetime.fromisoformat(s.replace("Z", "+00:00"))
-
-
-def fetch_page(after=None):
+def get_page(session, after=None):
+    """Fetch one page of trades (newest first). `after` = return trades older than this trade_id."""
     params = {"limit": PAGE_LIMIT}
     if after is not None:
         params["after"] = after
-    for attempt in range(MAX_RETRIES):
-        r = requests.get(TRADES_URL, params=params, headers=HEADERS, timeout=20)
+    for attempt in range(8):
+        try:
+            r = session.get(API_URL, params=params, timeout=30)
+        except requests.RequestException as exc:
+            print(f"request error ({exc}), retrying...", file=sys.stderr)
+            time.sleep(2 ** min(attempt, 5))
+            continue
         if r.status_code == 200:
             return r.json()
-        if r.status_code == 429 or r.status_code >= 500:
-            time.sleep(1.5 * (attempt + 1))
+        if r.status_code in (429, 500, 502, 503, 504):
+            time.sleep(2 ** min(attempt, 5))
             continue
         r.raise_for_status()
-    raise RuntimeError(f"Coinbase API failed after {MAX_RETRIES} retries (last status {r.status_code})")
+    raise RuntimeError("Coinbase API kept failing after retries")
 
 
-def summarise_day(day_start: datetime, day_end: datetime):
-    """Walk trades newest -> oldest and count per price bucket until the first trade of the day."""
-    counts = {}
-    total = 0
-    after = None
-    pages = 0
-    done = False
-    while not done:
-        trades = fetch_page(after)
-        pages += 1
-        if not trades:
-            break
-        for t in trades:
-            ts = parse_time(t["time"])
-            if ts >= day_end:
-                continue                 # newer than the window
-            if ts < day_start:
-                done = True              # reached the previous day
-                break
-            low = int(float(t["price"]) // BUCKET * BUCKET)
-            counts[low] = counts.get(low, 0) + 1
-            total += 1
-        after = min(t["trade_id"] for t in trades)
-        if MAX_PAGES and pages >= MAX_PAGES:
-            print(f"MAX_PAGES={MAX_PAGES} reached: counts are PARTIAL (test mode)")
-            break
-        if pages % 100 == 0:
-            print(f"... {pages} pages, {total:,} trades counted")
-        time.sleep(SLEEP_BETWEEN_CALLS)
-    return counts, total, pages
-
-
-def build_body(counts: dict) -> str:
-    return "\n".join(f"{low:,} - {low + BUCKET - 1:,} : {counts[low]:,}" for low in sorted(counts))
+def fmt_range(lo):
+    return f"{lo:,} - {lo + BUCKET - 1:,}"
 
 
 def main():
     now = datetime.now(timezone.utc)
-    today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
-    if SUMMARY_DAY == "today":
-        day_start, day_end = today_start, today_start + timedelta(days=1)
-    else:
-        day_start, day_end = today_start - timedelta(days=1), today_start
+    today = now.strftime("%Y-%m-%d")
+    start_iso = f"{today}T00:00:00"  # ISO UTC strings compare correctly as text
 
-    title = f"{day_start.strftime('%Y-%m-%d')} summary"
-    counts, total, pages = summarise_day(day_start, day_end)
-    print(f"{title}: {total:,} trades, {len(counts)} groups, {pages} pages")
+    counts = Counter()
+    newest_ts = None   # latest trade of the day (first one seen, we go backwards)
+    oldest_ts = None   # first trade of the day (last one counted)
+    total = 0
+    after = None
+    done = False
+    pages = 0
+
+    with requests.Session() as session:
+        while not done:
+            trades = get_page(session, after)
+            pages += 1
+            if not trades:
+                break
+            for t in trades:
+                ts = t["time"]
+                if ts < start_iso:
+                    done = True
+                    break
+                if newest_ts is None:
+                    newest_ts = ts
+                oldest_ts = ts
+                lo = math.floor(float(t["price"]) / BUCKET) * BUCKET
+                counts[lo] += 1
+                total += 1
+            if len(trades) < PAGE_LIMIT:
+                break  # reached the start of the available history
+            after = trades[-1]["trade_id"]
+            time.sleep(PAUSE)
 
     if not counts:
-        print("No trades found. Nothing sent.")
+        print(f"No {PRODUCT_ID} trades found yet for {today} (UTC). Nothing to send.")
         return
 
-    body = build_body(counts)
+    body = "\n".join(f"{fmt_range(lo)} : {counts[lo]:,}" for lo in sorted(counts))
+    title = f"{today} summary"
+
+    # Console output (same summary as the notification body)
+    print(f"{title} | {PRODUCT_ID} | {total:,} trades | {pages} pages")
+    print(f"From first trade: {oldest_ts}  To latest trade: {newest_ts}  (UTC)")
+    print("-" * 40)
+    print(body)
+
     size = len(body.encode("utf-8"))
     if size > NTFY_MAX_BYTES:
-        print(f"Body too large ({size} bytes > {NTFY_MAX_BYTES}). Nothing sent.")
+        print(f"\nBody is {size} bytes (limit {NTFY_MAX_BYTES}). Not sending notification.")
         return
 
-    r = requests.post(NTFY_URL, data=body.encode("utf-8"), headers={"Title": title}, timeout=20)
-    r.raise_for_status()
-    print(f"Sent to ntfy ({size} bytes).")
+    resp = requests.post(
+        NTFY_URL,
+        data=body.encode("utf-8"),
+        headers={"Title": title},
+        timeout=30,
+    )
+    resp.raise_for_status()
+    print(f"\nNotification sent to {NTFY_URL} ({size} bytes).")
 
 
 if __name__ == "__main__":
-    try:
-        main()
-    except Exception as e:
-        print(f"ERROR: {e}", file=sys.stderr)
-        sys.exit(1)
+    main()
