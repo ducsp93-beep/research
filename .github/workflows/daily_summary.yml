@@ -1,0 +1,19 @@
+name: Daily trade summary
+
+on:
+  schedule:
+    # 23:50 UTC every day (= 06:50 next day in Vietnam). GitHub may delay cron runs.
+    - cron: "50 23 * * *"
+  workflow_dispatch:   # lets you run it manually from the Actions tab
+
+jobs:
+  summary:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install requests
+      - run: python daily_allocation_github.py
