@@ -19,15 +19,36 @@ Run:      python allocation_24h.py            (add --no-notify to skip the ntfy 
 """
 
 import argparse
+import importlib
 import os
 import re
+import subprocess
 import sys
 import time
 from collections import Counter
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 
-import requests
+
+def ensure(module, package=None):
+    """Import a module, pip-installing it first if it is missing."""
+    try:
+        return importlib.import_module(module)
+    except ImportError:
+        pkg = package or module
+        print(f"Installing missing package: {pkg}")
+        cmd = [sys.executable, "-m", "pip", "install", "-q", pkg]
+        try:
+            subprocess.check_call(cmd)
+        except subprocess.CalledProcessError:
+            # newer system Pythons refuse plain installs (PEP 668)
+            subprocess.check_call(cmd + ["--break-system-packages"])
+        importlib.invalidate_caches()
+        return importlib.import_module(module)
+
+
+requests = ensure("requests")
+ensure("matplotlib")
 
 # --------------------------------------------------------------------------- #
 # Parameters
